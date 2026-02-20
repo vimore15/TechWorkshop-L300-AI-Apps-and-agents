@@ -1,59 +1,69 @@
-name: Build and push container to ACR
+name: Deploy to Azure Container Registry
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+    paths:
+      - 'src/**'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
 
-permissions:
-  contents: read
+env:
+  AZURE_CONTAINER_REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  IMAGE_NAME: chat-app
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to Azure (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Validate required secrets
+        run: |
+          set -e
+          for secret_name in AZURE_CONTAINER_REGISTRY AZURE_CONTAINER_REGISTRY_USERNAME AZURE_CONTAINER_REGISTRY_PASSWORD ENV; do
+            if [ -z "${!secret_name}" ]; then
+              echo "Missing required secret: $secret_name"
+              exit 1
+            fi
+          done
+        env:
+          AZURE_CONTAINER_REGISTRY: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+          AZURE_CONTAINER_REGISTRY_USERNAME: ${{ secrets.AZURE_CONTAINER_REGISTRY_USERNAME }}
+          AZURE_CONTAINER_REGISTRY_PASSWORD: ${{ secrets.AZURE_CONTAINER_REGISTRY_PASSWORD }}
+          ENV: ${{ secrets.ENV }}
+
+      - name: Normalize ACR login server
+        id: acr
+        run: |
+          if [[ "${{ secrets.AZURE_CONTAINER_REGISTRY }}" == *.azurecr.io ]]; then
+            echo "login_server=${{ secrets.AZURE_CONTAINER_REGISTRY }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "login_server=${{ secrets.AZURE_CONTAINER_REGISTRY }}.azurecr.io" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create .env file from secret
+        run: 'printf "%s" "$ENV" > src/.env'
+        shell: bash
+        env:
+          ENV: ${{ secrets.ENV }}
 
       - name: Log in to Azure Container Registry
-        run: |
-          az acr login --name "${{ secrets.ACR_NAME }}"
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ steps.acr.outputs.login_server }}
+          username: ${{ secrets.AZURE_CONTAINER_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_CONTAINER_REGISTRY_PASSWORD }}
 
-      - name: Create .env from GitHub secret
-        working-directory: src
+      - name: Build and push Docker image
         run: |
-          # Write the ENV secret contents into a local .env file for the Docker build context.
-          # The file is not committed to git; it exists only on the GitHub runner.
-          printf "%s" "${{ secrets.ENV }}" > .env
-
-      - name: Build and push image
-        working-directory: src
-        env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-          IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
-        run: |
-          IMAGE_TAG=${GITHUB_SHA}
-          docker build -f Dockerfile -t "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" .
-          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
-
-      - name: (Optional) Also push :latest
-        if: ${{ always() }}
-        working-directory: src
-        env:
-          ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-          IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
-        run: |
-          docker tag "$ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}" "$ACR_LOGIN_SERVER/$IMAGE_NAME:latest"
-          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:latest"
+          cd src/
+          docker build -t ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:latest .
+          docker push ${{ steps.acr.outputs.login_server }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Cleanup .env
         if: ${{ always() }}
-        working-directory: src
-        run: |
-          rm -f .env
+        run: rm -f src/.env
